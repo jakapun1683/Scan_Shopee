@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>ระบบสแกน Tracking พัสดุ</title>
+    <!-- Tailwind CSS สำหรับการตกแต่งให้รองรับมือถือ -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- HTML5 QR Code Scanner Library -->
+    <script src="https://unpkg.com/html5-qrcode"></script>
+    <!-- SweetAlert2 สำหรับแจ้งเตือนสวยๆ -->
+    <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Prompt:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Prompt', sans-serif;
+            background-color: #f3f4f6;
+        }
+        #reader {
+            width: 100%;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            background: white;
+        }
+        #reader video {
+            object-fit: cover;
+        }
+    </style>
+</head>
+<body class="min-h-screen flex flex-col items-center p-4">
+
+    <!-- Header -->
+    <div class="w-full max-w-md text-center mb-6 mt-4">
+        <h1 class="text-2xl font-bold text-gray-800">📦 สแกนใบปะหน้าพัสดุ</h1>
+        <p class="text-gray-500 text-sm mt-1">ข้อมูลจะถูกส่งเข้า Google Sheets อัตโนมัติ</p>
+    </div>
+
+    <!-- Scanner Container -->
+    <div class="w-full max-w-md bg-white p-4 rounded-2xl shadow-lg mb-6">
+        <div id="reader" class="mb-4"></div>
+        
+        <!-- ข้อมูลที่สแกนได้ -->
+        <div class="mb-4">
+            <label class="block text-sm font-medium text-gray-700 mb-1">เลข Tracking ล่าสุด (พร้อมใช้เครื่องสแกนทันที)</label>
+            <input type="text" id="scanResult" readonly class="w-full px-4 py-3 bg-gray-50 border border-gray-300 rounded-lg text-lg font-semibold text-center text-blue-600 focus:outline-none" placeholder="ไม่ต้องคลิก เสียบเครื่องสแกนแล้วยิงได้เลย...">
+        </div>
+
+        <div class="flex gap-2">
+            <button id="startBtn" class="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-medium py-3 px-4 rounded-lg transition-colors">
+                ▶️ เปิดกล้อง
+            </button>
+            <button id="stopBtn" class="flex-1 bg-red-500 hover:bg-red-600 text-white font-medium py-3 px-4 rounded-lg transition-colors hidden">
+                ⏹️ ปิดกล้อง
+            </button>
+        </div>
+    </div>
+
+    <!-- ประวัติการสแกนล่าสุด (จำลอง) -->
+    <div class="w-full max-w-md bg-white p-4 rounded-2xl shadow-lg">
+        <h2 class="text-md font-semibold text-gray-700 mb-3">🕒 ประวัติการสแกนล่าสุด</h2>
+        <ul id="historyList" class="space-y-2 text-sm">
+            <li class="text-gray-400 text-center py-2" id="emptyHistory">ยังไม่มีข้อมูลการสแกน</li>
+        </ul>
+    </div>
+
+    <script>
+        // =========================================================================
+        // URL สำหรับเชื่อมต่อกับ Google Sheets ของคุณ
+        // =========================================================================
+        const GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwGFAGnhvkFMN10czj501qEXP36-Gxf_UKp8lZQUarwXHkC8hM26f_zip2JfdOHq6T1/exec";
+        
+        let html5QrcodeScanner;
+        let isProcessing = false; // ป้องกันการสแกนซ้ำรัวๆ
+        let audioCtx = null; // ตัวแปรสำหรับสร้างเสียงบี๊บ (Web Audio API)
+
+        // ฟังก์ชันสร้างเสียงบี๊บ (สแกนสำเร็จ)
+        function playBeep() {
+            try {
+                // สร้าง Audio Context เมื่อมีการเรียกใช้งานครั้งแรก
+                if (!audioCtx) {
+                    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                }
+                // ถ้าบราวเซอร์สั่งหยุดเล่นเสียงชั่วคราว ให้ปลุกมันขึ้นมา
+                if (audioCtx.state === 'suspended') {
+                    audioCtx.resume();
+                }
+                const osc = audioCtx.createOscillator();
+                const gain = audioCtx.createGain();
+                
+                osc.type = 'sine'; // คลื่นเสียงแบบ Sine (เสียงใสสไตล์บาร์โค้ดสแกนเนอร์)
+                osc.frequency.setValueAtTime(1000, audioCtx.currentTime); // ความถี่ 1000Hz (โทนเสียงแหลมสแกนเนอร์)
+                
+                gain.gain.setValueAtTime(0.3, audioCtx.currentTime); // ความดัง
+                gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.15); // ค่อยๆ เฟดเสียงลงใน 0.15 วินาที
+                
+                osc.connect(gain);
+                gain.connect(audioCtx.destination);
+                
+                osc.start();
+                osc.stop(audioCtx.currentTime + 0.15);
+            } catch (e) {
+                console.error("Audio Playback Error:", e);
+            }
+        }
+
+        // เริ่มการทำงานของกล้อง
+        function startScanner() {
+            document.getElementById('startBtn').classList.add('hidden');
+            document.getElementById('stopBtn').classList.remove('hidden');
+
+            // ตั้งค่า Scanner
+            html5QrcodeScanner = new Html5Qrcode("reader");
+            const config = { 
+                fps: 30, // ⚡ เพิ่ม FPS จาก 10 เป็น 30 เพื่อให้กล้องจับภาพและสแกนได้ไวขึ้น
+                qrbox: { width: 300, height: 120 }, // ⚡ ปรับกรอบให้เป็นสี่เหลี่ยมผืนผ้ากว้างๆ เพื่อให้พอดีกับบาร์โค้ดใบปะหน้า
+                aspectRatio: 1.0,
+                disableFlip: false, // ⚡ รองรับการสแกนแบบกลับหัว
+                formatsToSupport: [ 
+                    Html5QrcodeSupportedFormats.QR_CODE,
+                    Html5QrcodeSupportedFormats.CODE_128, // บาร์โค้ดใบปะหน้าส่วนใหญ่ใช้ Code 128
+                    Html5QrcodeSupportedFormats.CODE_39,
+                    Html5QrcodeSupportedFormats.EAN_13
+                ]
+            };
+
+            // เปิดกล้องหลัง (environment)
+            html5QrcodeScanner.start(
+                { facingMode: "environment" }, 
+                config, 
+                onScanSuccess,
+                onScanFailure
+            ).catch(err => {
+                Swal.fire('ข้อผิดพลาด', 'ไม่สามารถเข้าถึงกล้องได้ กรุณาอนุญาตการใช้งานกล้อง', 'error');
+                stopScanner();
+            });
+        }
+
+        // หยุดกล้อง
+        function stopScanner() {
+            if (html5QrcodeScanner) {
+                html5QrcodeScanner.stop().then(() => {
+                    document.getElementById('startBtn').classList.remove('hidden');
+                    document.getElementById('stopBtn').classList.add('hidden');
+                }).catch(err => console.error("Failed to stop scanner", err));
+            }
+        }
+
+        // เมื่อสแกนสำเร็จ (จากกล้อง)
+        function onScanSuccess(decodedText, decodedResult) {
+            processScannedData(decodedText);
+        }
+
+        function onScanFailure(error) {
+            // จะมีการ error ตลอดเวลาที่มันหาสแกนไม่เจอ ไม่ต้อง alert
+        }
+
+        // ฟังก์ชันจัดการข้อมูล (ใช้ร่วมกันทั้งกล้อง และ เครื่องสแกนบาร์โค้ด)
+        function processScannedData(trackingNumber) {
+            if (isProcessing) return; // ป้องกันสแกนซ้ำรัวๆ
+            isProcessing = true;
+
+            // เล่นเสียงบี๊บแจ้งเตือนสแกนสำเร็จทันที!
+            playBeep();
+
+            document.getElementById('scanResult').value = trackingNumber;
+            
+            // ส่งข้อมูลไปทำงานเบื้องหลังทันทีโดยไม่ต้องหยุดกล้อง
+            sendDataToGoogleSheets(trackingNumber);
+
+            // หน่วงเวลา 1.5 วินาทีก่อนจะพร้อมสแกนกล่องต่อไป
+            setTimeout(() => {
+                isProcessing = false;
+                document.getElementById('scanResult').value = '';
+            }, 1500);
+        }
+
+        // รองรับเครื่องสแกนบาร์โค้ดแบบ "ไม่ต้องคลิก" (Global Keystroke Listener)
+        let barcodeBuffer = "";
+        let barcodeTimeout = null;
+
+        document.addEventListener('keydown', function(e) {
+            // ไม่สนใจปุ่มพิเศษอื่นๆ (Shift, Ctrl, Alt, etc.)
+            if (e.key.length !== 1 && e.key !== 'Enter') return;
+
+            // เคลียร์ Timeout เก่าทุกครั้งที่มีการพิมพ์
+            if (barcodeTimeout) clearTimeout(barcodeTimeout);
+
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                if (barcodeBuffer.trim() !== '') {
+                    processScannedData(barcodeBuffer.trim());
+                    barcodeBuffer = ""; // ล้างค่าหลังสแกนสำเร็จ
+                }
+            } else {
+                barcodeBuffer += e.key;
+            }
+
+            // เครื่องสแกนบาร์โค้ดจะพิมพ์ไวมาก 
+            // ถ้าเว้นช่วงเกิน 200ms ให้ถือว่าไม่ใช่การใช้สแกนเนอร์ ให้ล้างค่าทิ้ง
+            barcodeTimeout = setTimeout(() => {
+                barcodeBuffer = "";
+            }, 200);
+        });
+
+        // ฟังก์ชันส่งข้อมูลไป Google Sheets
+        function sendDataToGoogleSheets(trackingNumber) {
+            // 1. อัพเดทประวัติบนหน้าจอทันที (ไม่ต้องรอ Google Sheets)
+            updateHistory(trackingNumber);
+            
+            // 2. แสดงแจ้งเตือนมุมบนแบบ Toast (ไม่บล็อกหน้าจอ)
+            Swal.fire({
+                toast: true,
+                position: 'top',
+                icon: 'success',
+                title: `สแกนสำเร็จ: ${trackingNumber}`,
+                showConfirmButton: false,
+                timer: 1500,
+                background: '#4ade80',
+                color: '#fff'
+            });
+
+            // 3. ส่งข้อมูลไป Google Sheets เบื้องหลัง (Background process)
+            const requestUrl = `${GOOGLE_SCRIPT_URL}?tracking=${encodeURIComponent(trackingNumber)}`;
+            fetch(requestUrl, {
+                method: 'GET',
+                mode: 'no-cors' // บังคับไม่ให้เว็บบล็อกข้ามโดเมน
+            }).catch(error => {
+                console.error('Error background sync!', error);
+            });
+        }
+
+        // เพิ่มรายการประวัติลงในหน้าจอ
+        function updateHistory(tracking) {
+            const historyList = document.getElementById('historyList');
+            const emptyMsg = document.getElementById('emptyHistory');
+            if(emptyMsg) emptyMsg.remove();
+
+            const time = new Date().toLocaleTimeString('th-TH');
+            const li = document.createElement('li');
+            li.className = 'flex justify-between items-center bg-gray-50 p-2 rounded border border-gray-100';
+            li.innerHTML = `
+                <span class="font-medium text-blue-600">${tracking}</span>
+                <span class="text-xs text-gray-500">${time}</span>
+            `;
+            
+            // ใส่ไว้บนสุด
+            historyList.insertBefore(li, historyList.firstChild);
+
+            // เก็บแค่ 5 รายการล่าสุด
+            if(historyList.children.length > 5) {
+                historyList.removeChild(historyList.lastChild);
+            }
+        }
+
+        // Event Listeners
+        document.getElementById('startBtn').addEventListener('click', startScanner);
+        document.getElementById('stopBtn').addEventListener('click', stopScanner);
+
+    </script>
+</body>
+</html>
