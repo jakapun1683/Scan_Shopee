@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>ระบบสแกน Tracking พัสดุ</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/html5-qrcode"></script>
+    <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Prompt:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Prompt', sans-serif;
+            background-color: #f3f4f6;
+        }
+        #reader {
+            width: 100%;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            background: white;
+        }
+        #reader video {
+            object-fit: cover;
+        }
+    </style>
+</head>
+<body class="min-h-screen flex flex-col items-center p-4">
+
+    <!-- Header -->
+    <div class="w-full max-w-md text-center mb-6 mt-4">
+        <h1 class="text-2xl font-bold text-gray-800">📦 สแกนใบปะหน้าพัสดุ</h1>
+        <p class="text-gray-500 text-sm mt-1">พร้อมบันทึกภาพถ่ายลง Google Sheets อัตโนมัติ</p>
+    </div>
+
+    <!-- Scanner Container -->
+    <div class="w-full max-w-md bg-white p-4 rounded-2xl shadow-lg mb-6">
+        <div id="reader" class="mb-4"></div>
+        
+        <!-- ข้อมูลที่สแกนได้ -->
+        <div class="mb-4">
+            <label class="block text-sm font-medium text-gray-700 mb-1">เลข Tracking ล่าสุด</label>
+            <input type="text" id="scanResult" readonly class="w-full px-4 py-3 bg-gray-50 border border-gray-300 rounded-lg text-lg font-semibold text-center text-blue-600 focus:outline-none" placeholder="ไม่ต้องคลิก เสียบเครื่องสแกนแล้วยิงได้เลย...">
+        </div>
+
+        <div class="flex gap-2">
+            <button id="startBtn" class="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-medium py-3 px-4 rounded-lg transition-colors">
+                ▶️ เปิดกล้อง
+            </button>
+            <button id="stopBtn" class="flex-1 bg-red-500 hover:bg-red-600 text-white font-medium py-3 px-4 rounded-lg transition-colors hidden">
+                ⏹️ ปิดกล้อง
+            </button>
+        </div>
+    </div>
+
+    <!-- ประวัติการสแกนล่าสุด -->
+    <div class="w-full max-w-md bg-white p-4 rounded-2xl shadow-lg">
+        <h2 class="text-md font-semibold text-gray-700 mb-3">🕒 ประวัติการสแกนล่าสุด</h2>
+        <ul id="historyList" class="space-y-2 text-sm">
+            <li class="text-gray-400 text-center py-2" id="emptyHistory">ยังไม่มีข้อมูลการสแกน</li>
+        </ul>
+    </div>
+
+    <script>
+        // =========================================================================
+        // URL สำหรับเชื่อมต่อกับ Google Sheets ของคุณ
+        // =========================================================================
+        const GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwGFAGnhvkFMN10czj501qEXP36-Gxf_UKp8lZQUarwXHkC8hM26f_zip2JfdOHq6T1/exec";
+        
+        let html5QrcodeScanner;
+        let isProcessing = false;
+        let audioCtx = null; 
+
+        // สร้างเสียงบี๊บ
+        function playBeep() {
+            try {
+                if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                if (audioCtx.state === 'suspended') audioCtx.resume();
+                const osc = audioCtx.createOscillator();
+                const gain = audioCtx.createGain();
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(1000, audioCtx.currentTime);
+                gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.15);
+                osc.connect(gain);
+                gain.connect(audioCtx.destination);
+                osc.start();
+                osc.stop(audioCtx.currentTime + 0.15);
+            } catch (e) {
+                console.error("Audio Error:", e);
+            }
+        }
+
+        // ฟังก์ชันจับภาพจากวิดีโอ (ถ่ายรูปตอนสแกนติด)
+        function captureImageFromVideo() {
+            const video = document.querySelector('#reader video');
+            // ถ้าวิดีโอยังไม่ทำงาน ให้ข้ามการถ่ายรูปไป
+            if (!video || video.readyState !== 4) return null; 
+
+            const canvas = document.createElement('canvas');
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+            // แปลงรูปเป็น Base64 และลดคุณภาพลงเหลือ 50% เพื่อให้ส่งข้อมูลได้ไวๆ
+            return canvas.toDataURL('image/jpeg', 0.5); 
+        }
+
+        function startScanner() {
+            document.getElementById('startBtn').classList.add('hidden');
+            document.getElementById('stopBtn').classList.remove('hidden');
+
+            html5QrcodeScanner = new Html5Qrcode("reader");
+            const config = { 
+                fps: 30, 
+                qrbox: { width: 300, height: 120 }, 
+                aspectRatio: 1.0,
+                disableFlip: false,
+                formatsToSupport: [ 
+                    Html5QrcodeSupportedFormats.QR_CODE,
+                    Html5QrcodeSupportedFormats.CODE_128,
+                    Html5QrcodeSupportedFormats.CODE_39,
+                    Html5QrcodeSupportedFormats.EAN_13
+                ]
+            };
+
+            html5QrcodeScanner.start(
+                { facingMode: "environment" }, 
+                config, 
+                onScanSuccess,
+                onScanFailure
+            ).catch(err => {
+                Swal.fire('ข้อผิดพลาด', 'ไม่สามารถเข้าถึงกล้องได้', 'error');
+                stopScanner();
+            });
+        }
+
+        function stopScanner() {
+            if (html5QrcodeScanner) {
+                html5QrcodeScanner.stop().then(() => {
+                    document.getElementById('startBtn').classList.remove('hidden');
+                    document.getElementById('stopBtn').classList.add('hidden');
+                }).catch(err => console.error("Failed to stop", err));
+            }
+        }
+
+        function onScanSuccess(decodedText) {
+            processScannedData(decodedText);
+        }
+
+        function onScanFailure(error) {}
+
+        // ฟังก์ชันจัดการข้อมูล 
+        function processScannedData(trackingNumber) {
+            if (isProcessing) return; 
+            isProcessing = true;
+
+            playBeep();
+            document.getElementById('scanResult').value = trackingNumber;
+            
+            // 📸 ถ่ายรูปทันที ณ จังหวะที่สแกนติด!
+            const imageBase64 = captureImageFromVideo();
+
+            sendDataToGoogleSheets(trackingNumber, imageBase64);
+
+            // ยืดเวลา Delay เป็น 2 วินาที
+            setTimeout(() => {
+                isProcessing = false;
+                document.getElementById('scanResult').value = '';
+            }, 2000);
+        }
+
+        // รองรับเครื่องสแกนบาร์โค้ด
+        let barcodeBuffer = "";
+        let barcodeTimeout = null;
+
+        document.addEventListener('keydown', function(e) {
+            if (e.key.length !== 1 && e.key !== 'Enter') return;
+            if (barcodeTimeout) clearTimeout(barcodeTimeout);
+
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                if (barcodeBuffer.trim() !== '') {
+                    processScannedData(barcodeBuffer.trim());
+                    barcodeBuffer = "";
+                }
+            } else {
+                barcodeBuffer += e.key;
+            }
+
+            barcodeTimeout = setTimeout(() => {
+                barcodeBuffer = "";
+            }, 200);
+        });
+
+        // ส่งข้อมูล + รูปภาพ ไป Google Sheets
+        function sendDataToGoogleSheets(trackingNumber, imageBase64) {
+            updateHistory(trackingNumber, imageBase64);
+            
+            Swal.fire({
+                toast: true,
+                position: 'top',
+                icon: 'success',
+                title: `สแกนสำเร็จ: ${trackingNumber}`,
+                showConfirmButton: false,
+                timer: 1500,
+                background: '#4ade80',
+                color: '#fff'
+            });
+
+            // ส่งข้อมูลแบบ POST เพื่อให้รองรับภาพขนาดใหญ่
+            fetch(GOOGLE_SCRIPT_URL, {
+                method: 'POST',
+                mode: 'no-cors', // สำคัญ: ป้องกันมือถือบล็อกข้ามโดเมน (CORS)
+                headers: {
+                    'Content-Type': 'text/plain;charset=utf-8' // สำคัญ: หลอกบราวเซอร์ว่าเป็นข้อความธรรมดา
+                },
+                body: JSON.stringify({
+                    tracking: trackingNumber,
+                    image: imageBase64
+                })
+            }).catch(error => {
+                console.error('Upload error!', error);
+            });
+        }
+
+        // เพิ่มรายการประวัติ (พร้อมรูปย่อ)
+        function updateHistory(tracking, imageBase64) {
+            const historyList = document.getElementById('historyList');
+            const emptyMsg = document.getElementById('emptyHistory');
+            if(emptyMsg) emptyMsg.remove();
+
+            const time = new Date().toLocaleTimeString('th-TH');
+            const li = document.createElement('li');
+            li.className = 'flex justify-between items-center bg-gray-50 p-2 rounded border border-gray-100';
+            
+            // ถ้ามีรูป ให้แสดงรูปย่อ (Thumbnail) ด้วย
+            const imageHtml = imageBase64 ? `<img src="${imageBase64}" class="w-10 h-10 object-cover rounded-md shadow-sm ml-2">` : `<div class="w-10 h-10 bg-gray-200 rounded-md flex items-center justify-center text-xs text-gray-400 ml-2">ไม่มีรูป</div>`;
+
+            li.innerHTML = `
+                <div class="flex items-center">
+                    ${imageHtml}
+                    <div class="flex flex-col ml-3">
+                        <span class="font-medium text-blue-600">${tracking}</span>
+                        <span class="text-xs text-gray-500">${time}</span>
+                    </div>
+                </div>
+            `;
+            
+            historyList.insertBefore(li, historyList.firstChild);
+
+            if(historyList.children.length > 5) {
+                historyList.removeChild(historyList.lastChild);
+            }
+        }
+
+        document.getElementById('startBtn').addEventListener('click', startScanner);
+        document.getElementById('stopBtn').addEventListener('click', stopScanner);
+    </script>
+</body>
+</html>
